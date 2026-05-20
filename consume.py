@@ -59,24 +59,37 @@ async def main_async(manifest_path: Path) -> None:
         log.info("sending prompt: %r", prompt)
         await session.send_input({"type": "text", "data": prompt})
 
+        # `session.recv_data()` returns bare values — `str` for text
+        # RuntimeData (one per token), `bytes` (or `bytearray`) for
+        # audio RuntimeData. NOT a `{"type": ..., "data": ...}` dict.
+        # We bound the loop with a per-recv timeout so a stuck turn
+        # doesn't deadlock the smoke.
         text_pieces: list[str] = []
         audio_chunks = 0
-        while True:
-            out = await session.recv_data()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 90.0  # generous per-turn cap
+        while loop.time() < deadline:
+            try:
+                out = await asyncio.wait_for(session.recv_data(), timeout=10.0)
+            except asyncio.TimeoutError:
+                log.warning("no data for 10 s — assuming turn done")
+                break
             if out is None:
                 break
-            kind = out.get("type", "?") if isinstance(out, dict) else type(out).__name__
-            if kind == "text":
-                snippet = out.get("data", "") if isinstance(out, dict) else ""
-                if snippet == "<|audio_end|>":
+            if isinstance(out, str):
+                if out == "<|audio_end|>":
                     break
-                if snippet == "<|text_end|>":
+                if out == "<|text_end|>":
                     continue
-                text_pieces.append(snippet)
-            elif kind == "audio":
+                text_pieces.append(out)
+            elif isinstance(out, (bytes, bytearray, memoryview)):
                 audio_chunks += 1
             else:
-                log.debug("unexpected output kind: %s", kind)
+                # Defensive — newer SDK versions may shift the wire
+                # format (e.g. RuntimeData dicts). Don't drop them
+                # silently; log so the user notices.
+                log.debug("unexpected output of type %s: %r",
+                          type(out).__name__, out)
 
         text = "".join(text_pieces).strip()
         log.info("→ text: %r", text)
