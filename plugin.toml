@@ -1,0 +1,54 @@
+# LFM2.5-Audio shipped as Python source — no cdylib, no Cargo.
+#
+# Path-5 sibling of `examples/lfm25-audio-loadable/` (cdylib): same
+# `LFM2AudioNode` semantics (interleaved text+audio S2S, control-bus
+# aux ports), distributed as plain Python instead of a compiled .so.
+#
+# Resolver dispatch when a manifest references this directory (or a
+# tagged GitHub release):
+#
+#   1. Parse this plugin.toml.
+#   2. See `language = "python"`.
+#   3. Provision a uv-managed venv from [python].requires.
+#      (~5-7 GB on first run: torch+CUDA+liquid-audio+transformers.)
+#   4. Spawn `python -m remotemedia.core.multiprocessing.runner`
+#      with --module-root <this dir> --register-module lfm2_audio_source.
+#   5. Register LFM2AudioNode into the executor's registry.
+#
+# The plugin's Python process is fully isolated from the host's
+# in-tree `remotemedia.nodes.ml.lfm2_audio` import — no conflict if
+# both register the same node_type.
+
+[plugin]
+name        = "lfm2-audio-python-source"
+version     = "0.1.0"
+language    = "python"
+description = "LFM2.5-Audio speech-to-speech node, distributed as Python source. Drop-in equivalent to the in-tree `LFM2AudioNode`, isolated in a per-plugin uv venv."
+license     = "RemoteMedia-Community-License-1.0"
+
+[python]
+entry_module = "lfm2_audio_source"
+node_types   = ["LFM2AudioNode"]
+module_root  = "."
+
+# Heavy ML deps go in a per-plugin uv venv so they don't pollute the
+# host's Python install. Same constraint set as the in-tree
+# `@python_requires([...])` on LFM2AudioNode:
+#
+#   - liquid-audio: the upstream SDK that owns LFM2AudioModel + Mimi
+#   - transformers <5.0: liquid-audio 1.1.0 imports Lfm2HybridConvCache,
+#     a private 4.54-era symbol removed in 5.x.
+#   - safetensors <0.5: 0.5+ on Windows crashes during accelerate's
+#     mmapped tensor load (verified on RTX 4090 + cu128). 0.4.5 stays
+#     on the older non-mmap GPU path.
+#   - torch/torchaudio: liquid-audio transitive — pinned here in case
+#     uv resolves to mismatched majors.
+#   - accelerate: liquid-audio's checkpoint loader uses it.
+requires = [
+    "liquid-audio>=0.1",
+    "transformers>=4.54.0,<5.0",
+    "torch>=2.1",
+    "torchaudio>=2.1",
+    "accelerate>=0.33",
+    "safetensors<0.5",
+]

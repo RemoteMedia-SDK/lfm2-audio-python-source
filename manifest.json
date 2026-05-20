@@ -1,0 +1,27 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "lfm2-audio-python-source-smoke",
+    "description": "Local source-load: manifest plugin entry points at a directory containing plugin.toml. Resolver dispatches to SourcePythonFactory, provisions a uv venv with torch+liquid-audio+transformers, spawns the runner, and registers LFM2AudioNode."
+  },
+  "plugins": [
+    "."
+  ],
+  "nodes": [
+    {
+      "id": "audio",
+      "node_type": "LFM2AudioNode",
+      "params": {
+        "hf_repo": "LiquidAI/LFM2.5-Audio-1.5B",
+        "system_prompt": "Respond with interleaved text and audio.",
+        "max_new_tokens": 256,
+        "sample_rate": 24000,
+        "text_only": false
+      }
+    }
+  ],
+  "connections": [],
+  "python_env": {
+    "python_version": "3.12"
+  }
+}
