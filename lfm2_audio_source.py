@@ -65,6 +65,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, TYPE_CHECKING, Union
@@ -213,6 +214,7 @@ class LFM2AudioNode(MultiprocessNode):
         text_only: bool = False,
         audio_batch_size: int = 12,
         first_chunk_audio_batch_size: Optional[int] = None,
+        warmup_on_init: bool = True,
         **kwargs: Any,
     ) -> None:
         # Multiprocess runner's 3-attempt construction: str → TypeError → config=...
@@ -270,6 +272,19 @@ class LFM2AudioNode(MultiprocessNode):
         self.first_chunk_audio_batch_size = (
             max(1, int(_fc)) if _fc is not None else None
         )
+        # CUDA-kernel JIT warmup. `LFM2AudioModel.from_pretrained` loads
+        # weights into GPU memory but does NOT compile the kernels —
+        # PyTorch defers that to first use. Without a warmup pass, the
+        # user's first peer.offer pays ~3-5 s of kernel compilation +
+        # KV-cache allocation + first-time audio-encoder/Mimi-codec
+        # forward inside `initialize()`'s caller (typically
+        # `WarmSessionPool::prewarm`), the cost is paid at server boot
+        # instead of on the first peer connection.
+        #
+        # Set `warmup_on_init=False` (or `"warmup_on_init": false` in
+        # manifest params) to skip — useful in tests that don't need
+        # the steady-state latency floor.
+        self.warmup_on_init = bool(params.get("warmup_on_init", warmup_on_init))
 
         # Pin to a *specific* CUDA index. liquid_audio 1.1.0 with a bare
         # `device="cuda"` lets the library / HF accelerate spread submodules
@@ -498,7 +513,81 @@ class LFM2AudioNode(MultiprocessNode):
 
         self._initialized = True
         logger.info("LFM2-Audio model loaded")
+
+        # Run the warmup *before* spawning the session-cleanup task —
+        # `initialize()` is awaited synchronously by
+        # `WarmSessionPool::prewarm`, so any work here gates the
+        # "READY" log on the server. The warmup compiles CUDA kernels
+        # + allocates the first KV cache + exercises the Mimi codec
+        # once, removing the 3-5 s cliff from the user's first turn.
+        if self.warmup_on_init:
+            self._warmup_inference()
+
         self._cleanup_task = asyncio.create_task(self._cleanup_expired_sessions())
+
+    def _warmup_inference(self) -> None:
+        """One-shot dummy forward pass that JIT-compiles CUDA kernels.
+
+        Without this, the first real user turn pays ~3-5 s of kernel
+        compilation + KV-cache allocation + first audio-encoder /
+        Mimi-codec pass. Loading weights into GPU memory via
+        `LFM2AudioModel.from_pretrained` does NOT eagerly compile —
+        PyTorch defers until first use. Calling a tiny synthetic
+        inference here ties that cost to plugin init, which
+        `WarmSessionPool::prewarm` already awaits.
+
+        Failures are caught and logged — a broken warmup must not
+        take down `initialize()`. Worst case the user pays the
+        cold-start on their first turn (the prior behaviour).
+        """
+        if self._model is None or self._processor is None:
+            return
+
+        t0 = time.perf_counter()
+        try:
+            # 0.25 s of silence at the model's native sample rate is
+            # enough to exercise the audio encoder, the depth-former
+            # path, and the Mimi codec — i.e. every CUDA kernel the
+            # first real turn will hit. Smaller buffers risk
+            # short-circuit paths skipping a kernel; longer adds
+            # boot-time latency for no extra coverage.
+            n_samples = max(1, int(self.sample_rate * 0.25))
+            silence = np.zeros(n_samples, dtype=np.float32)
+            wav = torch.from_numpy(silence).float().unsqueeze(0)
+
+            chat = ChatState(self._processor)
+            chat.new_turn("system")
+            chat.add_text(self._system_prompt)
+            chat.end_turn()
+            chat.new_turn("user")
+            chat.add_audio(wav, self.sample_rate)
+            chat.end_turn()
+            chat.new_turn("assistant")
+
+            # `max_new_tokens=2` covers both the first-token kernel
+            # (prefill) and the continuation kernel (decode step) —
+            # JIT-compiling both. Discarding the output; this
+            # `ChatState` is throwaway and never enters
+            # `self._sessions`.
+            gen = self._model.generate_interleaved(
+                **chat,
+                max_new_tokens=2,
+                audio_temperature=self.audio_temperature,
+                audio_top_k=self.audio_top_k,
+            )
+            for _ in gen:
+                pass
+
+            logger.info(
+                "[%s] warmup inference complete in %.2fs",
+                self.node_id, time.perf_counter() - t0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] warmup inference failed after %.2fs (%s) — "
+                "first real turn will pay the kernel-compile cost",
+                self.node_id, time.perf_counter() - t0, exc,
+            )
 
     async def cleanup(self) -> None:
         if self._cleanup_task is not None:
