@@ -743,6 +743,15 @@ class LFM2AudioNode(MultiprocessNode):
     async def _process_audio_turn(
         self, data: Any
     ) -> AsyncGenerator[Any, None]:
+        # Wall-clock anchor for the per-turn TTFA log. Captured at the
+        # earliest reachable point inside the generator so the reported
+        # elapsed includes everything between "node received the
+        # multiprocess IPC frame" and "first audio chunk yielded back
+        # to Rust" — i.e. modality dispatch, ChatState mutation,
+        # model.generate_interleaved JIT/prefill, Mimi codec decode,
+        # and RuntimeData wrapping.
+        t_turn_start = time.perf_counter()
+
         if not _HAS_RUNTIME_DATA or RuntimeData is None:
             logger.error(
                 "[%s] RuntimeData bindings unavailable in this worker — "
@@ -892,6 +901,9 @@ class LFM2AudioNode(MultiprocessNode):
         )
 
         emitted_audio_samples = 0
+        # One-shot latch so the TTFA log fires exactly once per turn
+        # (on the very first audio_rd we hand back to the runtime).
+        first_audio_emitted = False
 
         def _normalize_audio_code_token(t: Any) -> torch.Tensor:
             t = t.detach()
@@ -1040,6 +1052,17 @@ class LFM2AudioNode(MultiprocessNode):
                     confirmed_audio_batch.clear()
 
                     if audio_rd is not None:
+                        if not first_audio_emitted:
+                            logger.info(
+                                "[%s] first audio emitted in %.3fs "
+                                "(session=%s turn=%d, batch=%d)",
+                                self.node_id,
+                                time.perf_counter() - t_turn_start,
+                                session_id,
+                                session_state.turn_count,
+                                emit_threshold,
+                            )
+                            first_audio_emitted = True
                         yield audio_rd
                         await asyncio.sleep(0)
                         first_chunk_active = False
@@ -1053,6 +1076,18 @@ class LFM2AudioNode(MultiprocessNode):
             confirmed_audio_batch.clear()
 
             if audio_rd is not None:
+                if not first_audio_emitted:
+                    # Tail-flush is the first emit when the whole reply
+                    # fits in a single (sub-batch-threshold) chunk.
+                    logger.info(
+                        "[%s] first audio emitted in %.3fs "
+                        "(session=%s turn=%d, tail-flush)",
+                        self.node_id,
+                        time.perf_counter() - t_turn_start,
+                        session_id,
+                        session_state.turn_count,
+                    )
+                    first_audio_emitted = True
                 yield audio_rd
                 await asyncio.sleep(0)
 

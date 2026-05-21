@@ -21,7 +21,7 @@
 
 [plugin]
 name        = "lfm2-audio-python-source"
-version     = "0.1.2"
+version     = "0.1.3"
 language    = "python"
 description = "LFM2.5-Audio speech-to-speech node, distributed as Python source. Drop-in equivalent to the in-tree `LFM2AudioNode`, isolated in a per-plugin uv venv."
 license     = "RemoteMedia-Community-License-1.0"
